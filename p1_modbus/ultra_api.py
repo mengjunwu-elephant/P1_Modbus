@@ -1,11 +1,10 @@
 """
-UltraArm P1 high-level API: ``get_*`` / ``set_*`` naming aligned with ``ultraArm P1协议文档.xlsx``
-and common host SDK conventions.
+UltraArm P1 Modbus 高层 API。
 
-- **get_*** return ``int``, ``list[int]``, or ``list[float]`` (e.g. M405 angles in degrees).
-- **set_*** return ``int`` ``0`` on successful transaction (raises on timeout / protocol error).
+命名与参数语义对齐 ``docs/ultraArm_P1_zh.md``；底层为 ModbusRTU + CommandAddress + 直接组帧。
 
-Low-level G/M helpers remain on :class:`P1Client` unchanged.
+- **get_***：返回 ``int``、``list[int]`` 或 ``list[float]``
+- **set_***：成功返回 ``0``（超时/协议错误抛异常）
 """
 
 from __future__ import annotations
@@ -16,96 +15,107 @@ from collections.abc import Callable, Sequence
 from typing import cast
 
 from p1_modbus.commands import P1Client
-from p1_modbus.models import ConveyorParams, GripperParams, PreviewPose, RgbColor
+from p1_modbus.command_address import CommandAddress as A
+from p1_modbus.models import BaseIoOutput, ConveyorControl, DigitalIoOutput, GripperParams, KinematicsInput, RgbColor
+from p1_modbus import ultra_api_limits as lim
+from p1_modbus.modbus_rtu import centi_to_i16, decode_i16_centideg_list, decode_u8_list
+
+# ---------------------------------------------------------------------------
+# 组帧辅助（centi-units ×100，大端 int16）
+# ---------------------------------------------------------------------------
 
 
-def _u8_list(data: bytes) -> list[int]:
-    return [int(b) for b in data]
+def _to_centimil(x: float | int, *, strict: bool = True) -> int:
+    return centi_to_i16(x, strict=strict)
 
 
-def _be_i16_list(data: bytes) -> list[int]:
-    if len(data) % 2 != 0:
-        return _u8_list(data)
-    fmt = ">" + "h" * (len(data) // 2)
-    return list(struct.unpack(fmt, data))
-
-
-def _bytes_u8(seq: Sequence[int], expected_len: int, *, label: str) -> bytes:
-    if len(seq) != expected_len:
-        raise ValueError(f"{label}: need {expected_len} bytes, got {len(seq)}")
-    return bytes(int(x) & 0xFF for x in seq)
-
-
-def _to_centimil(x: float | int) -> int:
-    """Physical degrees or millimetres → centi-units (×100) for int16 wire format."""
-    v = int(round(float(x) * 100.0))
-    if v < -32768 or v > 32767:
-        raise ValueError(f"value out of int16 range after ×100: {x!r} -> {v}")
-    return v
-
-
-def _pack_4_axes_speed_10(axes: Sequence[float | int], speed: float | int) -> bytes:
-    """G0/G1 10-byte payload: 4× int16 BE (axes) + int16 BE (speed), all centi-units (×100)."""
-    if len(axes) != 4:
-        raise ValueError("axes must have exactly 4 entries (degrees or mm each); speed is separate")
-    return struct.pack(
-        ">hhhhh",
-        _to_centimil(axes[0]),
-        _to_centimil(axes[1]),
-        _to_centimil(axes[2]),
-        _to_centimil(axes[3]),
-        _to_centimil(speed),
-    )
-
-
-def _pack_2_axes_speed_6(axes: Sequence[float | int], speed: float | int) -> bytes:
-    """6-byte payload: 2× int16 BE (axes) + int16 BE (speed), all centi-units (×100)."""
-    if len(axes) != 2:
-        raise ValueError("axes must have exactly 2 entries (degrees or mm each); speed is separate")
-    return struct.pack(">hhh", _to_centimil(axes[0]), _to_centimil(axes[1]), _to_centimil(speed))
-
-
-def _is_coord_sequence(obj: object) -> bool:
-    """True for list/tuple of numbers; False for str/bytes/scalar."""
+def _is_sequence(obj: object) -> bool:
     return isinstance(obj, Sequence) and not isinstance(obj, (str, bytes))
 
 
-def _pack_axis_value_speed_6(axis_1based: int, value: float | int, speed: float | int) -> bytes:
-    """
-    G1 单关节 / 单坐标 6 字节：``轴号(1–4)``、``目标(×100 大端 int16)``、``速度(×100)``。
-
-    例：关节 1 → 0°、速度 100 → ``00 01 00 00 27 10``。
-    """
-    a = int(axis_1based)
-    if a < 1 or a > 4:
-        raise ValueError("axis must be 1..4 (关节 1–4 或坐标 X,Y,Z,RX)")
-    return struct.pack(">hhh", a, _to_centimil(value), _to_centimil(speed))
-
-
-def _direction_to_i16(d: int | bool) -> int:
-    """M13/M14 方向字段：1 正向，0 反向（大端 int16）。"""
-    if isinstance(d, bool):
-        return 1 if d else 0
-    di = int(d)
-    if di not in (0, 1):
-        raise ValueError("direction must be 0 (reverse), 1 (forward), or bool")
-    return di
+def _pack_4_axes_speed_10(
+    axes: Sequence[float | int],
+    speed: float | int,
+    *,
+    validate: bool = True,
+) -> bytes:
+    if len(axes) != 4:
+        raise ValueError("需要 4 个轴分量")
+    lim.validate_if(validate, lim.validate_speed, speed)
+    return struct.pack(
+        ">hhhhh",
+        _to_centimil(axes[0], strict=validate),
+        _to_centimil(axes[1], strict=validate),
+        _to_centimil(axes[2], strict=validate),
+        _to_centimil(axes[3], strict=validate),
+        _to_centimil(speed, strict=validate),
+    )
 
 
-def _pack_jog_axis_direction_speed_6(axis_1based: int, direction: int | bool, speed: float | int) -> bytes:
-    """M13/M14：轴号 1–4（关节 A–D 或坐标维）+ 方向 0/1 + 速度（×100，同 set_angle）。"""
-    a = int(axis_1based)
-    if a < 1 or a > 4:
-        raise ValueError("axis must be 1..4 (关节 A–D 或坐标 X,Y,Z,RX)")
-    return struct.pack(">hhh", a, _direction_to_i16(direction), _to_centimil(speed))
+def _pack_axis_value_speed_6(
+    axis: int,
+    value: float | int,
+    speed: float | int,
+    *,
+    validate: bool = True,
+) -> bytes:
+    lim.validate_if(validate, lim.validate_axis_id, axis)
+    lim.validate_if(validate, lim.validate_coord_axis, axis, value)
+    lim.validate_if(validate, lim.validate_speed, speed)
+    return struct.pack(
+        ">hhh",
+        axis,
+        _to_centimil(value, strict=validate),
+        _to_centimil(speed, strict=validate),
+    )
 
 
-def _pack_jog_axis_step_speed_6(axis_1based: int, step: float | int, speed: float | int) -> bytes:
-    """M19/M20：轴号 1–4 + 步进量（度/mm ×100）+ 速度（×100）。"""
-    a = int(axis_1based)
-    if a < 1 or a > 4:
-        raise ValueError("axis must be 1..4 (关节 A–D 或坐标 X,Y,Z,RX)")
-    return struct.pack(">hhh", a, _to_centimil(step), _to_centimil(speed))
+def _pack_joint_value_speed_6(
+    joint: int,
+    angle: float | int,
+    speed: float | int,
+    *,
+    validate: bool = True,
+) -> bytes:
+    lim.validate_if(validate, lim.validate_joint_angle, joint, angle)
+    lim.validate_if(validate, lim.validate_speed, speed)
+    return struct.pack(
+        ">hhh",
+        joint,
+        _to_centimil(angle, strict=validate),
+        _to_centimil(speed, strict=validate),
+    )
+
+
+def _pack_jog_dir_6(
+    axis: int,
+    direction: int | bool,
+    speed: float | int,
+    *,
+    validate: bool = True,
+) -> bytes:
+    lim.validate_if(validate, lim.validate_axis_id, axis)
+    lim.validate_if(validate, lim.validate_jog_direction, direction)
+    lim.validate_if(validate, lim.validate_speed, speed)
+    d = 1 if direction is True else 0 if direction is False else int(direction)
+    return struct.pack(">hhh", axis, d, _to_centimil(speed, strict=validate))
+
+
+def _pack_jog_step_6(
+    axis: int,
+    step: float | int,
+    speed: float | int,
+    *,
+    validate: bool = True,
+) -> bytes:
+    lim.validate_if(validate, lim.validate_axis_id, axis)
+    lim.validate_if(validate, lim.validate_speed, speed)
+    return struct.pack(
+        ">hhh",
+        axis,
+        _to_centimil(step, strict=validate),
+        _to_centimil(speed, strict=validate),
+    )
 
 
 def _write_ok(_: bytes) -> int:
@@ -114,12 +124,9 @@ def _write_ok(_: bytes) -> int:
 
 class UltraArmP1Modbus(P1Client):
     """
-    UltraArm P1 Modbus RTU facade with ``get_*`` / ``set_*``.
+    UltraArm P1 Modbus RTU 门面类，API 命名对齐 ``docs/ultraArm_P1_zh.md``。
 
-    With ``debug=True``, the base client attaches a stderr logging handler so **TX/RX**
-    frames are printed without extra :mod:`logging` setup.
-
-    The serial port opens automatically on the first command (no need to call :meth:`~p1_modbus.client.P1ClientBase.open`).
+    ``debug=True`` 时自动向 stderr 打印 TX/RX；首次收发自动打开串口。
     """
 
     def __init__(
@@ -129,106 +136,167 @@ class UltraArmP1Modbus(P1Client):
         timeout: float = 0.3,
         debug: bool = False,
         *,
+        validate_limits: bool = True,
         write_timeout: float | None = None,
         event_hook: Callable[[bytes], None] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
+        """
+        Args:
+            validate_limits: 为 ``False`` 时跳过 Python 侧物理量/范围校验，组帧时 int16
+                按 16 位截断而非抛错（仍保留长度、类型等基础检查）。
+        """
         super().__init__(
             port,
             baudrate,
             timeout,
             debug,
+            validate_limits=validate_limits,
             write_timeout=write_timeout,
             event_hook=event_hook,
             logger=logger,
         )
 
-    # --- firmware (G6/G7, M401/M402) ---
+    def _v(self, fn: Callable[..., None], /, *args, **kwargs) -> None:
+        lim.validate_if(self.validate_limits, fn, *args, **kwargs)
+
+    # --- 固件版本 ---
     def get_system_version(self) -> int:
-        """G6: main MCU firmware version (u16 BE, e.g. ``00 0A`` → 10)."""
+        """读取固件主版本号（G6，Modbus ``0x0001``，u16 BE）。"""
         return int(self.read_main_fw_version())
 
     def get_modify_version(self) -> int:
-        """G7: main MCU correction / patch byte."""
+        """读取固件更正版本号（G7，``0x0002``）。"""
         return int(self.read_main_fw_patch())
 
     def get_system_screen_version(self) -> int:
-        """M401: screen firmware version (u16 BE, e.g. ``00 0C`` → 12)."""
+        """读取屏幕固件主版本号（M401，``0x0101``）。"""
         return int(self.read_display_fw_version())
 
-    def get_screen_modify_version(self) -> int:
-        """M402: screen correction / patch byte."""
+    def get_modify_screen_version(self) -> int:
+        """读取屏幕固件更正版本号（M402，``0x0102``）。"""
         return int(self.read_display_fw_patch())
 
-    # --- pose / state reads (M405/M406/G8/M200/M600) ---
-    def get_angles(self) -> list[float]:
-        """
-        M405: joint angles in **degrees** (device sends big-endian signed int16 **centidegrees**, ÷100).
+    # --- 位姿 / 状态读 ---
+    def get_angles_info(self) -> list[float]:
+        """获取当前关节角 [J1..J4]（度）（M405，``0x0104``）。"""
+        return decode_i16_centideg_list(self.read_p1(A.M405))
 
-        Example raw ``DD 36`` → -8906 → **-89.06**°.
-        """
-        raw = _be_i16_list(self.m405_read_angles())
-        return [x / 100.0 for x in raw]
+    def get_coords_info(self) -> list[float]:
+        """获取当前坐标 [X,Y,Z,Rx]（mm/度）（M406，``0x0105``）。"""
+        return decode_i16_centideg_list(self.read_p1(A.M406))
 
-    def get_coords(self) -> list[float]:
-        """
-        M406: coordinates in **same unit as device int16 centi-units** (typically mm×100), ÷100.
+    def get_error_information(self) -> list[int]:
+        """读取错误信息字节列表（G8，``0x0106``，32 位错误位）。"""
+        return decode_u8_list(self.read_p1(A.G8))
 
-        Same packing as angles: big-endian signed int16 per value.
-        """
-        raw = _be_i16_list(self.m406_read_coordinates())
-        return [x / 100.0 for x in raw]
-
-    def get_errors(self) -> list[int]:
-        """G8: error dword as list of u8 (MSB..LSB order of payload bytes)."""
-        return _u8_list(self.g8_read_errors())
-
-    def get_runtime_state(self) -> int:
-        """M200: main runtime state byte."""
+    def get_run_status(self) -> int:
+        """读取运行状态：0 静止，1 运动中（M200，``0x0107``）。"""
         return int(self.m200_read_main_runtime_state())
 
-    def get_buffer_size(self) -> int:
-        """M600: motion buffer size (u16 BE)."""
+    def get_queue_size(self) -> int:
+        """读取运动缓冲区队列大小（M600，``0x0109``）。"""
         return int(self.m600_read_motion_buffer_size())
 
-    def get_motor_status(self) -> list[int]:
-        """M22: five motor status bytes."""
+    def get_motor_enable_status(self) -> list[int]:
+        """读取五路电机使能状态（M22，``0x0012``）。"""
         return list(self.m22_read_motor_status())
 
-    def get_zero_calibration_state(self) -> list[int]:
-        """M119: four joints zero-calibration flags."""
+    def get_zero_calibration_state(self, joint_number: int | None = None) -> list[int]:
+        """
+        读取零位校准状态，四关节 [0/1]（M119，``0x001F``）。
+
+        Args:
+            joint_number: 保留与文档一致；Modbus 固定返回四关节列表。
+        """
+        if joint_number is not None:
+            self._v(lim.validate_joint_id, int(joint_number), allow_all=True)
         return list(self.m119_read_zero_calibration_state())
 
-    def get_gripper_angle_centideg(self) -> int:
-        """M50: gripper angle raw u16 (divide by 100 for degrees per protocol note)."""
-        return int(self.m50_read_gripper_angle_centideg())
+    def get_gripper_angle(self) -> int:
+        """读取夹爪角度 1–100（M50，``0x0020``）。"""
+        return int(self.m50_read_gripper_angle())
 
-    def get_gripper_motion_state(self) -> int:
-        """M27: gripper motion state u16 BE."""
-        return int(self.m27_read_gripper_motion_state())
+    def get_gripper_parameter(self, addr: int) -> int:
+        """读取夹爪参数（M26，``0x0023``）。addr 范围 1–69。"""
+        self._v(lim.validate_gripper_addr, addr)
+        return int(self.m26_read_gripper_params(GripperParams(addr, 1, 0)))
 
-    def get_gripper_param(self, j: int, k: int) -> int:
-        """M26: read gripper parameter slot selected by J/K (L unused, sent as 0)."""
-        return int(self.m26_read_gripper_params(GripperParams(j & 0xFFFF, k & 0xFFFF, 0)))
+    def get_all_base_io_states(self) -> list[int]:
+        """读取底座 10 路 IO 状态 0–3（M61，``0x0029``）。"""
+        return [int(b) for b in self.m61_read_base_io()]
 
-    def get_base_io(self) -> list[int]:
-        """M61: base IO raw bytes."""
-        return _u8_list(self.m61_read_base_io())
+    def get_base_io_state(self, pin_no: int) -> int:
+        """读取单个底座 IO 引脚状态（pin 1–10）。"""
+        self._v(lim.validate_base_io_pin, pin_no)
+        states = self.get_all_base_io_states()
+        if pin_no < 1 or pin_no > len(states):
+            raise ValueError(f"pin_no {pin_no} 超出返回长度 {len(states)}")
+        return int(states[pin_no - 1])
 
-    def get_tool_io(self) -> list[int]:
-        """M63: tool/end IO raw bytes."""
-        return _u8_list(self.m63_read_tool_io())
+    def get_all_end_io_states(self) -> list[int]:
+        """读取末端 4 路 IO 状态 0–3（M63，``0x002B``）。"""
+        return [int(b) for b in self.m63_read_tool_io()]
 
-    def get_pose_preview_ok(self, pose8: Sequence[int]) -> int:
+    def get_end_io_state(self, pin_no: int) -> int:
+        """读取单个末端 IO 引脚状态（pin 1–4）。"""
+        self._v(lim.validate_end_io_pin, pin_no)
+        states = self.get_all_end_io_states()
+        return int(states[pin_no - 1])
+
+    def get_pwm_status(self) -> list[int]:
         """
-        M51: preview reachability. Returns ``1`` if device reports reachable (``00 01``), else ``0``.
-        ``pose8`` must be eight byte values (0..255).
-        """
-        payload = _bytes_u8(pose8, 8, label="pose8")
-        ok = self.m51_preview(PreviewPose(payload))
-        return 1 if ok else 0
+        读取 PWM 输出状态，长度 4（M84，``0x0032``）。
 
-    # --- motion / machine writes ---
+        [激光开关, 激光档位, 自定义开关, 自定义档位]
+        """
+        return list(self.m84_read_pwm_status())
+
+    def coord_inverse_solution(self, coords: Sequence[float | int]) -> list[float]:
+        """
+        坐标逆解：输入 [X,Y,Z,R] 返回关节角（M46，``0x0033``）。
+
+        Args:
+            coords: 长度 4 的坐标列表，范围同 ``set_coords``。
+        """
+        if len(coords) != 4:
+            raise ValueError("coords 长度须为 4")
+        self._v(lim.validate_coords, coords)
+        kin = KinematicsInput(tuple(float(c) for c in coords))
+        return list(self.m46_inverse_solution(kin))
+
+    def angle_correct_solution(self, angles: Sequence[float | int]) -> list[float]:
+        """
+        角度正解：输入 [J1..J4] 返回坐标（M47，``0x0034``）。
+
+        Args:
+            angles: 长度 4，各关节角范围见 ``set_angle``。
+        """
+        self._v(lim.validate_joint_angles, angles)
+        kin = KinematicsInput(tuple(float(a) for a in angles))
+        return list(self.m47_forward_solution(kin))
+
+    # --- 运动写 ---
+    def set_coords_max_speed(self, coords: Sequence[float | int]) -> int:
+        """
+        以最大速度发送坐标（G0，``0x0003``）。
+
+        Args:
+            coords: [X,Y,Z,Rx] 或 [X,Y,Z]（Rx 缺省为 0）。
+        """
+        cs = list(coords)
+        if len(cs) == 3:
+            cs.append(0.0)
+        if len(cs) != 4:
+            raise ValueError("coords 长度须为 3 或 4")
+        self._v(lim.validate_coords, cs)
+        payload = struct.pack(
+            ">hhhhh",
+            *(_to_centimil(c, strict=self.validate_limits) for c in cs),
+            _to_centimil(lim.SPEED_RANGE[1], strict=self.validate_limits),
+        )
+        return _write_ok(self.g0_coordinate_max_speed(payload))
+
     def set_coords(
         self,
         x_or_axes: Sequence[float | int] | float | int,
@@ -236,67 +304,26 @@ class UltraArmP1Modbus(P1Client):
         z: float | int | None = None,
         rx: float | int | None = None,
         speed: float | int | None = None,
-        *,
-        max_speed: bool = True,
     ) -> int:
         """
-        坐标运动（4 维 + speed，10 字节）。轴 **1=X, 2=Y, 3=Z, 4=RX**。
+        规定速度坐标运动（G1，``0x0004``）。
 
-        - 推荐：``set_coords(x, y, z, rx, speed, *, max_speed=True)``
-        - 兼容：``set_coords([x, y, z, rx], speed, *, max_speed=...)``
-        - ``max_speed=True``（默认）：G0 最大速度；``False``：G1 规定速度坐标。
+        Args:
+            speed: 1–100。可 ``set_coords([x,y,z,rx], speed)`` 或五参数形式。
         """
-        if _is_coord_sequence(x_or_axes):
-            if speed is not None:
-                raise ValueError("set_coords([x,y,z,rx], speed): do not pass keyword speed= when using list form")
-            if y_or_speed is None:
-                raise ValueError("set_coords(axes, speed): need speed as second argument")
-            axes = cast(Sequence[float | int], x_or_axes)
-            if len(axes) != 4:
-                raise ValueError("axes must have exactly 4 entries (X,Y,Z,RX)")
-            payload = _pack_4_axes_speed_10(axes, y_or_speed)
-        else:
-            if y_or_speed is None or z is None or rx is None or speed is None:
-                raise ValueError(
-                    "set_coords(x, y, z, rx, speed): need five numbers "
-                    "(axis 1–4 = X,Y,Z,RX then speed); or set_coords([x,y,z,rx], speed)"
-                )
-            payload = _pack_4_axes_speed_10(
-                (x_or_axes, y_or_speed, z, rx),
-                speed,
-            )
-        if max_speed:
-            return _write_ok(self.g0_coordinate_max_speed(payload))
+        payload = self._motion_payload_4_speed(x_or_axes, y_or_speed, z, rx, speed)
         return _write_ok(self.g1_coordinate_fixed_speed(payload))
 
     def set_coord(
         self,
-        axis_or_axes: int | Sequence[float | int],
-        value_or_speed: float | int,
-        speed: float | int | None = None,
+        coord_id: int,
+        coord: float | int,
+        speed: float | int,
     ) -> int:
-        """
-        G1 单坐标（6 字节）。
-
-        - ``set_coord(axis, value, speed)``：``axis`` 为 **1–4**（X,Y,Z,RX）；线格式为
-          ``轴号 int16 + 目标×100 + 速度×100``（与单关节相同排布）。
-        - ``set_coord([axis, value], speed)``：首元须为 ``int`` 且 1–4，与三参数等价。
-        - 首元为浮点等时：仍按 **两坐标分量 + 速度** 的旧 6 字节。
-        """
-        if speed is None:
-            axes = cast(Sequence[float | int], axis_or_axes)
-            if len(axes) != 2:
-                raise ValueError("set_coord: need two values in sequence, or use set_coord(axis, value, speed)")
-            if isinstance(axes[0], int) and 1 <= axes[0] <= 4:
-                return _write_ok(
-                    self.g1_single_coordinate(_pack_axis_value_speed_6(axes[0], float(axes[1]), value_or_speed))
-                )
-            return _write_ok(self.g1_single_coordinate(_pack_2_axes_speed_6(axes, value_or_speed)))
-        if not isinstance(axis_or_axes, int):
-            raise TypeError("set_coord(axis, value, speed): axis must be int 1..4 when three arguments are used")
-        return _write_ok(
-            self.g1_single_coordinate(_pack_axis_value_speed_6(axis_or_axes, float(value_or_speed), speed))
-        )
+        """单坐标运动（G1 单坐标，``0x0006``）。coord_id: 1=X,2=Y,3=Z,4=Rx；speed 1–100。"""
+        return _write_ok(self.g1_single_coordinate(
+            _pack_axis_value_speed_6(coord_id, coord, speed, validate=self.validate_limits)
+        ))
 
     def set_angles(
         self,
@@ -306,177 +333,224 @@ class UltraArmP1Modbus(P1Client):
         j4: float | int | None = None,
         speed: float | int | None = None,
     ) -> int:
-        """
-        G1 关节（4 关节 + speed，10 字节）。轴 **1–4** 对应四个关节角顺序。
-
-        - 推荐：``set_angles(j1, j2, j3, j4, speed)``
-        - 兼容：``set_angles([j1,j2,j3,j4], speed)``
-        """
-        if _is_coord_sequence(j1_or_axes):
-            if speed is not None:
-                raise ValueError("set_angles([...], speed): do not pass keyword speed= when using list form")
-            if j2_or_speed is None:
-                raise ValueError("set_angles(axes, speed): need speed as second argument")
-            axes = cast(Sequence[float | int], j1_or_axes)
-            if len(axes) != 4:
-                raise ValueError("axes must have exactly 4 entries")
-            payload = _pack_4_axes_speed_10(axes, j2_or_speed)
-        else:
-            if j2_or_speed is None or j3 is None or j4 is None or speed is None:
-                raise ValueError(
-                    "set_angles(j1, j2, j3, j4, speed): need five numbers "
-                    "or set_angles([j1,j2,j3,j4], speed)"
-                )
-            payload = _pack_4_axes_speed_10((j1_or_axes, j2_or_speed, j3, j4), speed)
+        """四关节运动（G1 关节，``0x0005``）。speed 范围 1–100。"""
+        payload = self._motion_payload_4_speed(j1_or_axes, j2_or_speed, j3, j4, speed, joint=True)
         return _write_ok(self.g1_joint(payload))
 
-    def set_angle(
+    def set_angle(self, joint_id: int, angle: float | int, speed: float | int) -> int:
+        """单关节运动（G1 单关节，``0x0007``）。joint_id 1–4；speed 1–100。"""
+        return _write_ok(self.g1_single_joint(
+            _pack_joint_value_speed_6(joint_id, angle, speed, validate=self.validate_limits)
+        ))
+
+    def _motion_payload_4_speed(
         self,
-        axis_or_axes: int | Sequence[float | int],
-        value_or_speed: float | int,
-        speed: float | int | None = None,
-    ) -> int:
-        """
-        G1 单关节（6 字节）。
+        a1,
+        a2=None,
+        a3=None,
+        a4=None,
+        speed=None,
+        *,
+        joint: bool = False,
+    ) -> bytes:
+        if _is_sequence(a1):
+            if speed is not None:
+                raise ValueError("列表形式勿再传 keyword speed")
+            if a2 is None:
+                raise ValueError("需要第二参数 speed")
+            axes = cast(Sequence[float | int], a1)
+            if len(axes) != 4:
+                raise ValueError("需要 4 个分量")
+            if joint:
+                self._v(lim.validate_joint_angles, axes)
+            else:
+                self._v(lim.validate_coords, axes)
+            return _pack_4_axes_speed_10(axes, a2, validate=self.validate_limits)
+        if a2 is None or a3 is None or a4 is None or speed is None:
+            raise ValueError("需要五个数值或 [四元组], speed")
+        axes = (a1, a2, a3, a4)
+        if joint:
+            self._v(lim.validate_joint_angles, axes)
+        else:
+            self._v(lim.validate_coords, axes)
+        return _pack_4_axes_speed_10(axes, speed, validate=self.validate_limits)
 
-        - ``set_angle(axis, value, speed)``：``axis`` 为 **1–4**；线格式为
-          ``关节号 int16 + 角度×100 + 速度×100``（例：关节 1、0°、速度 100 → ``00 01 00 00 27 10``）。
-        - ``set_angle([axis, value], speed)``：首元须为 ``int`` 且 1–4，与三参数等价。
-        - 首元为浮点等时：仍按 **两关节角 + 速度** 的旧 6 字节（两 int16 + speed）。
-        """
-        if speed is None:
-            axes = cast(Sequence[float | int], axis_or_axes)
-            if len(axes) != 2:
-                raise ValueError("set_angle: need two values in sequence, or use set_angle(axis, value, speed)")
-            if isinstance(axes[0], int) and 1 <= axes[0] <= 4:
-                return _write_ok(
-                    self.g1_single_joint(_pack_axis_value_speed_6(axes[0], float(axes[1]), value_or_speed))
-                )
-            return _write_ok(self.g1_single_joint(_pack_2_axes_speed_6(axes, value_or_speed)))
-        if not isinstance(axis_or_axes, int):
-            raise TypeError("set_angle(axis, value, speed): axis must be int 1..4 when three arguments are used")
-        return _write_ok(self.g1_single_joint(_pack_axis_value_speed_6(axis_or_axes, float(value_or_speed), speed)))
-
-    def set_reboot_stm32(self) -> int:
-        """G10."""
+    def set_reboot(self) -> int:
+        """重启 STM32（G10，``0x0008``）。"""
         return _write_ok(self.g10_reboot_stm32())
 
-    def set_unlock(self) -> int:
-        """M5."""
+    def collision_unlock(self) -> int:
+        """碰撞检测后解锁（M5，``0x0009``）。"""
         return _write_ok(self.m5_unlock())
 
-    def set_jog_angle(self, joint: int, direction: int | bool, speed: float | int) -> int:
-        """M13 关节点动：关节 1–4（A–D）、方向（1 正向 / 0 反向）、速度（×100 编码，同 ``set_angle``）。"""
-        return _write_ok(self.m13_continuous_joint(_pack_jog_axis_direction_speed_6(joint, direction, speed)))
-
-    def set_jog_coord(self, axis: int, direction: int | bool, speed: float | int) -> int:
-        """M14 坐标点动：轴 1–4（X,Y,Z,RX）、方向、速度（×100）。"""
-        return _write_ok(self.m14_continuous_coordinate(_pack_jog_axis_direction_speed_6(axis, direction, speed)))
-
-    def jog_increment_angle(self, joint: int, step_angle: float | int, speed: float | int) -> int:
-        """M19 关节步进：关节 1–4、步进角度（度×100）、速度（×100）。"""
-        return _write_ok(self.m19_step_joint(_pack_jog_axis_step_speed_6(joint, step_angle, speed)))
-
-    def jog_increment_coord(self, axis: int, step: float | int, speed: float | int) -> int:
-        """M20 坐标步进：轴 1–4、步进量（mm 等×100）、速度（×100）。"""
-        return _write_ok(self.m20_step_coordinate(_pack_jog_axis_step_speed_6(axis, step, speed)))
-
-    def set_estop(self) -> int:
-        """M15."""
+    def stop(self) -> int:
+        """停止运动（M15，``0x000F``）。"""
         return _write_ok(self.m15_estop())
 
-    def set_relax_motors(self) -> int:
-        """M17."""
-        return _write_ok(self.m17_relax_motors())
+    def set_joint_release(self, joint_id: int = 0) -> int:
+        """放松关节（M17，``0x0010``）。joint_id 0–4（0=全部）。"""
+        self._v(lim.validate_joint_id, joint_id, allow_all=True)
+        return _write_ok(self.m17_relax_motors(joint_id))
 
-    def set_brake_motors(self) -> int:
-        """M18."""
-        return _write_ok(self.m18_brake_motors())
+    def set_joint_enable(self, joint_id: int = 0) -> int:
+        """锁紧关节（M18，``0x0011``）。参数同 ``set_joint_release``。"""
+        self._v(lim.validate_joint_id, joint_id, allow_all=True)
+        return _write_ok(self.m18_brake_motors(joint_id))
 
-    def set_rgb(self, r: int, g: int, b: int) -> int:
-        """M23."""
+    def set_jog_angle(self, joint_id: int, direction: int | bool, speed: float | int) -> int:
+        """关节点动（M13，``0x000A``）。direction 0/1；speed 1–100。"""
+        self._v(lim.validate_joint_id, joint_id, allow_all=False)
+        return _write_ok(self.m13_continuous_joint(
+            _pack_jog_dir_6(joint_id, direction, speed, validate=self.validate_limits)
+        ))
+
+    def set_jog_coord(self, axis_id: int, direction: int | bool, speed: float | int) -> int:
+        """坐标点动（M14，``0x000B``）。"""
+        return _write_ok(self.m14_continuous_coordinate(
+            _pack_jog_dir_6(axis_id, direction, speed, validate=self.validate_limits)
+        ))
+
+    def jog_increment_angle(self, joint_id: int, increment: float | int, speed: float | int) -> int:
+        """关节步进（M19，``0x000C``）。"""
+        self._v(lim.validate_joint_id, joint_id, allow_all=False)
+        return _write_ok(self.m19_step_joint(
+            _pack_jog_step_6(joint_id, increment, speed, validate=self.validate_limits)
+        ))
+
+    def jog_increment_coord(self, coord_id: int, increment: float | int, speed: float | int) -> int:
+        """坐标步进（M20，``0x000D``）。"""
+        return _write_ok(self.m20_step_coordinate(
+            _pack_jog_step_6(coord_id, increment, speed, validate=self.validate_limits)
+        ))
+
+    def set_color(self, r: int, g: int, b: int) -> int:
+        """设置 RGB 灯色（M23，``0x0013``）。分量 0–255。"""
+        self._v(lim.validate_rgb, r, g, b)
         return _write_ok(self.m23_rgb(RgbColor(r, g, b)))
 
-    def set_zero_calibration(self, joint_index: int) -> int:
-        """M30."""
-        return _write_ok(self.m30_zero_calibration(joint_index))
+    def set_zero_calibration(self, joint_number: int) -> int:
+        """零位校准（M30，``0x0014``）。joint_number 0–4。"""
+        self._v(lim.validate_joint_id, joint_number, allow_all=True)
+        return _write_ok(self.m30_zero_calibration(joint_number))
 
     def set_encoder_calibration_j1(self) -> int:
-        """M31."""
+        """J1 编码器校准（M31，``0x0015``）。"""
         return _write_ok(self.m31_encoder_calibration_j1())
 
     def set_clear_zero_calibration(self, joint_index: int) -> int:
-        """M32."""
+        """清除零位校准状态（M32，``0x0016``）。joint 1–4。"""
+        self._v(lim._in_range, "joint_index", joint_index, *lim.ZERO_CALIB_CLEAR_RANGE)
         return _write_ok(self.m32_clear_zero_calibration(joint_index))
 
     def set_buzzer(self, on: bool) -> int:
-        """M34."""
+        """蜂鸣器（M34，``0x0017``）。"""
         return _write_ok(self.m34_buzzer(on))
 
     def set_end_button_enable(self) -> int:
-        """M35."""
+        """末端按钮使能（M35）。"""
         return _write_ok(self.m35_enable_end_button())
 
     def set_end_button_disable(self) -> int:
-        """M36."""
+        """末端按钮失能（M36）。"""
         return _write_ok(self.m36_disable_end_button())
 
-    def set_force_homing(self) -> int:
-        """M37."""
+    def forced_reset_zero(self) -> int:
+        """强制回零（M37，``0x001A``）。"""
         return _write_ok(self.m37_force_homing())
 
-    def set_conveyor(self, payload10: Sequence[int]) -> int:
-        """M38."""
-        return _write_ok(self.m38_conveyor(ConveyorParams(_bytes_u8(payload10, 10, label="payload10"))))
+    def set_conveyor_control(self, state: int, direction: int, speed: int, distance: int) -> int:
+        """
+        传送带控制（M38，``0x001B``）。
 
-    def set_clear_errors(self) -> int:
-        """M40."""
+        Args:
+            state: 0/1；direction: 0 前进/1 后退；speed: 50–500000；distance: 0–1200 mm。
+        """
+        self._v(lim.validate_conveyor, state, direction, speed, distance)
+        ctrl = ConveyorControl(state, direction, speed, distance)
+        return _write_ok(self.m38_conveyor(ctrl))
+
+    def set_conveyor_stop(self) -> int:
+        """传送带停止（M39，``0x000E``，地址待实机确认）。"""
+        return _write_ok(self.m39_conveyor_stop())
+
+    def set_preview_mode(self, coords: Sequence[float | int]) -> int:
+        """
+        坐标轨迹预览（M51，``0x001D``）。不可达时返回 ``1``。
+
+        Args:
+            coords: [X,Y,Z,R]，范围同 ``set_coords``。
+        """
+        from p1_modbus.models import PreviewPose
+
+        if len(coords) != 4:
+            raise ValueError("coords 长度须为 4")
+        self._v(lim.validate_coords, coords)
+        ok = self.m51_preview(PreviewPose.from_values(coords, strict=self.validate_limits))
+        return 0 if ok else 1
+
+    def clear_error_status(self) -> int:
+        """清除错误状态（M40，``0x001C``）。"""
         return _write_ok(self.m40_clear_errors())
 
-    def set_gripper_angle(self, angle_centideg: int, speed_centideg: int) -> int:
-        """M25."""
-        return _write_ok(self.m25_gripper_angle(angle_centideg, speed_centideg))
+    def set_gripper_angle(self, gripper_angle: int, gripper_speed: int) -> int:
+        """设置夹爪角度 1–100 与速度 1–100（M25）。"""
+        self._v(lim.validate_gripper_angle, gripper_angle)
+        self._v(lim.validate_gripper_speed, gripper_speed)
+        return _write_ok(self.m25_gripper_angle(gripper_angle, gripper_speed))
 
-    def set_gripper_params(self, j: int, k: int, l_val: int) -> int:
-        """M24 (parameter L)."""
-        return _write_ok(self.m24_set_gripper_params(GripperParams(j & 0xFFFF, k & 0xFFFF, l_val & 0xFFFF)))
+    def set_gripper_parameter(self, addr: int, parameter_value: int) -> int:
+        """设置夹爪参数（M24）。addr 1–69，值 0–65535。"""
+        self._v(lim.validate_gripper_addr, addr)
+        self._v(lim.validate_gripper_param_value, parameter_value)
+        return _write_ok(self.m24_set_gripper_params(GripperParams(addr, 1, parameter_value)))
 
-    def set_gripper_enable(self, enable: bool) -> int:
-        """M28."""
-        return _write_ok(self.m28_gripper_enable(enable))
+    def set_gripper_enable_status(self, state: int) -> int:
+        """夹爪使能 0/1（M28）。"""
+        self._v(lim._in_range, "state", state, 0, 1)
+        return _write_ok(self.m28_gripper_enable(bool(state)))
 
-    def set_gripper_zero_calibration(self) -> int:
-        """M29."""
+    def set_gripper_zero(self) -> int:
+        """夹爪零位校准（M29）。"""
         return _write_ok(self.m29_gripper_zero_calibration())
 
-    def set_pump(self, on_mask: int) -> int:
-        """M70."""
-        return _write_ok(self.m70_pump(on_mask))
+    def set_pump_state(self, pump_state: int) -> int:
+        """吸泵状态 0 吸/1 吹/2 关（M70）。"""
+        self._v(lim.validate_pump_state, pump_state)
+        return _write_ok(self.m70_pump(pump_state))
 
-    def set_base_io(self, payload6: Sequence[int]) -> int:
-        """M60."""
-        return _write_ok(self.m60_set_base_io(_bytes_u8(payload6, 6, label="payload6")))
+    def set_base_io_output(self, pin_no: int, pin_status: int, pin_signal: int) -> int:
+        """底座 IO 输出（M60）。pin 1–10；模式 0 入/1 出；电平 0/1。"""
+        self._v(lim.validate_base_io_pin, pin_no)
+        self._v(lim.validate_io_mode, pin_status)
+        self._v(lim.validate_io_signal, pin_signal)
+        return _write_ok(self.m60_set_base_io(BaseIoOutput(pin_no, pin_status, pin_signal)))
 
-    def set_tool_io(self, payload4: Sequence[int]) -> int:
-        """M62."""
-        return _write_ok(self.m62_set_tool_io(_bytes_u8(payload4, 4, label="payload4")))
+    def set_digital_io_output(self, pin_no: int, pin_signal: int) -> int:
+        """末端数字 IO 输出（M62）。pin 3–4；电平 0/1。"""
+        self._v(lim.validate_digital_output_pin, pin_no)
+        self._v(lim.validate_io_signal, pin_signal)
+        return _write_ok(self.m62_set_tool_io(DigitalIoOutput(pin_no, pin_signal)))
 
-    def set_laser_switch(self, on: bool) -> int:
-        """M80."""
-        return _write_ok(self.m80_laser_switch(on))
+    def set_pwm_laser_mode(self, state: int) -> int:
+        """激光 PWM 开关 0/1（M80）。"""
+        self._v(lim.validate_pwm_mode, state)
+        return _write_ok(self.m80_laser_switch(bool(state)))
 
-    def set_laser_pwm(self, level: int) -> int:
-        """M81."""
-        return _write_ok(self.m81_laser_pwm(level))
+    def set_pwm_laser(self, p_value: int) -> int:
+        """激光 PWM 档位 0–255（M81）。"""
+        self._v(lim.validate_pwm_level, p_value)
+        return _write_ok(self.m81_laser_pwm(p_value))
 
-    def set_custom_pwm_switch(self, on: bool) -> int:
-        """M82."""
-        return _write_ok(self.m82_custom_pwm_switch(on))
+    def set_pwm_custom_mode(self, state: int) -> int:
+        """自定义 PWM 开关 0/1（M82）。"""
+        self._v(lim.validate_pwm_mode, state)
+        return _write_ok(self.m82_custom_pwm_switch(bool(state)))
 
-    def set_custom_pwm_level(self, level: int) -> int:
-        """M83."""
-        return _write_ok(self.m83_custom_pwm_level(level))
+    def set_pwm_custom(self, p_value: int) -> int:
+        """自定义 PWM 档位 0–255（M83）。"""
+        self._v(lim.validate_pwm_level, p_value)
+        return _write_ok(self.m83_custom_pwm_level(p_value))
 
-    def set_stm32_fw_update_request(self) -> int:
-        """G11."""
+    def upgrade_restart(self) -> int:
+        """固件升级重启请求（G11，``0x0108``）。"""
         return _write_ok(self.g11_request_stm32_fw_update())
