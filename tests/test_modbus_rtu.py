@@ -68,6 +68,13 @@ def test_g1_single_joint_write_pdu_example() -> None:
     )
 
 
+def test_m300_write_pdu_matches_protocol_example() -> None:
+    payload = bytes.fromhex("010112FFFF020102")
+    assert pdu.build_write_pdu(A.M300_WRITE, payload) == bytes.fromhex(
+        "2E10003608010112FFFF020102"
+    )
+
+
 def test_decode_pwm_status_4_bytes() -> None:
     assert pdu.decode_pwm_status(bytes.fromhex("01640164")) == [1, 100, 1, 100]
     assert pdu.decode_pwm_status(bytes.fromhex("00000000")) == [0, 0, 0, 0]

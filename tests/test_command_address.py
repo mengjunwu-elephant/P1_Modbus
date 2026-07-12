@@ -56,6 +56,11 @@ def test_core_addresses_present() -> None:
 
 
 
+def test_m300_and_m52_addresses_present() -> None:
+    assert CommandAddress.M300_WRITE == 0x0036
+    assert CommandAddress.M52 == 0x0038
+
+
 def test_m601_m602_not_defined() -> None:
 
     names = {n for n in dir(CommandAddress) if not n.startswith("_")}
