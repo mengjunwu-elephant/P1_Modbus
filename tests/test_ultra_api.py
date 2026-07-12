@@ -66,3 +66,17 @@ def test_ultra_api_logs_tx_rx(capsys: pytest.CaptureFixture[str]) -> None:
     assert "RX" in captured.err
 
     bot.close()
+
+
+def test_set_i2c_data_sends_protocol_payload() -> None:
+    bot = UltraArmP1Modbus("COM99")
+    sent: list[bytes] = []
+    bot.request = lambda frame, expect_fc=None: sent.append(frame) or bytes.fromhex("2E1000360000")
+    assert bot.set_i2c_data(1, 1, 0x12, 0xFFFF, b"\x01\x02") == 0
+    assert sent == [bytes.fromhex("2E10003608010112FFFF020102")]
+
+
+def test_get_limit_switch_state_decodes_one_byte() -> None:
+    bot = UltraArmP1Modbus("COM99")
+    bot.read_p1 = lambda addr: b"\x7F"
+    assert bot.get_limit_switch_state() == 0x7F

@@ -217,6 +217,9 @@ class UltraArmP1Modbus(P1Client):
         """读取夹爪角度 1–100（M50，``0x0020``）。"""
         return int(self.m50_read_gripper_angle())
 
+    def get_limit_switch_state(self) -> int:
+        return int(self.m52_read_limit_switch_state())
+
     def get_gripper_parameter(self, addr: int) -> int:
         """读取夹爪参数（M26，``0x0023``）。addr 范围 1–69。"""
         self._v(lim.validate_gripper_addr, addr)
@@ -517,6 +520,22 @@ class UltraArmP1Modbus(P1Client):
         """吸泵状态 0 吸/1 吹/2 关（M70）。"""
         self._v(lim.validate_pump_state, pump_state)
         return _write_ok(self.m70_pump(pump_state))
+
+    def set_i2c_data(
+        self,
+        session_id: int,
+        packet_id: int,
+        slave_address: int,
+        register_address: int,
+        data: bytes,
+    ) -> int:
+        raw = bytes(data)
+        self._v(lim._in_range, "session_id", session_id, 0, 255)
+        self._v(lim._in_range, "packet_id", packet_id, 0, 255)
+        self._v(lim._in_range, "slave_address", slave_address, 0, 125)
+        self._v(lim._in_range, "register_address", register_address, 0, 65535)
+        self._v(lim._in_range, "data length", len(raw), 1, 255)
+        return _write_ok(self.m300_write_i2c(session_id, packet_id, slave_address, register_address, raw))
 
     def set_base_io_output(self, pin_no: int, pin_status: int, pin_signal: int) -> int:
         """底座 IO 输出（M60）。pin 1–10；模式 0 入/1 出；电平 0/1。"""

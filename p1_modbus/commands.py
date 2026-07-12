@@ -111,6 +111,21 @@ class P1Client(ModbusRTU):
         tail = pdu.kinematics_read_tail(pose.payload)
         return pdu.decode_preview_ok(self.read_p1(A.M51, tail))
 
+    def m300_write_i2c(
+        self,
+        session_id: int,
+        packet_id: int,
+        slave_address: int,
+        register_address: int,
+        data: bytes,
+    ) -> bytes:
+        payload = bytes([session_id, packet_id, slave_address]) + register_address.to_bytes(2, "big")
+        payload += bytes([len(data)]) + data
+        return self.write_p1(A.M300_WRITE, payload)
+
+    def m52_read_limit_switch_state(self) -> int:
+        return pdu.decode_u8(self.read_p1(A.M52))
+
     def m46_inverse_solution(self, kin: KinematicsInput | PreviewPose) -> list[float]:
         strict = self.validate_limits
         if isinstance(kin, KinematicsInput):
