@@ -76,6 +76,23 @@ def test_set_i2c_data_sends_protocol_payload() -> None:
     assert sent == [bytes.fromhex("2E10003608010112FFFF020102")]
 
 
+def test_set_i2c_data_allows_249_bytes_with_ff_outer_length() -> None:
+    bot = UltraArmP1Modbus("COM99")
+    sent: list[bytes] = []
+    bot.request = lambda frame, expect_fc=None: sent.append(frame) or bytes.fromhex("2E1000360000")
+    data = bytes(range(249))
+
+    assert bot.set_i2c_data(1, 1, 0x12, 0xFFFF, data) == 0
+    assert sent[0][4] == 0xFF
+
+
+def test_set_i2c_data_rejects_250_bytes() -> None:
+    bot = UltraArmP1Modbus("COM99")
+
+    with pytest.raises(ValueError):
+        bot.set_i2c_data(1, 1, 0x12, 0xFFFF, bytes(250))
+
+
 def test_get_limit_switch_state_decodes_one_byte() -> None:
     bot = UltraArmP1Modbus("COM99")
     bot.read_p1 = lambda addr: b"\x7F"

@@ -534,7 +534,7 @@ class UltraArmP1Modbus(P1Client):
         self._v(lim._in_range, "packet_id", packet_id, 0, 255)
         self._v(lim._in_range, "slave_address", slave_address, 0, 125)
         self._v(lim._in_range, "register_address", register_address, 0, 65535)
-        self._v(lim._in_range, "data length", len(raw), 1, 255)
+        self._v(lim._in_range, "data length", len(raw), 1, 249)
         return _write_ok(self.m300_write_i2c(session_id, packet_id, slave_address, register_address, raw))
 
     def set_base_io_output(self, pin_no: int, pin_status: int, pin_signal: int) -> int:
