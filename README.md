@@ -1,12 +1,12 @@
-# P1_Modbus — Python 串口库（v0.3.0）
+# P1_Modbus — Python 串口库（v1.0.0）
 
-本目录位于仓库 **`elephant-pytest`** 根下的 `P1_Modbus/`。面向 UltraArm P1（从站地址 **`0x2E`**）的 **Modbus RTU** 风格串口协议：CRC16、粘包拆帧、**Pro450 风格三层架构**（ModbusRTU + CommandAddress + 业务类）。
+本目录位于仓库 **`elephant-pytest`** 根下的 `P1_Modbus/`。面向 UltraArm P1（从站地址 **`0x2E`**）的 **Modbus RTU** 风格串口协议：CRC16、粘包拆帧、三层架构（ModbusRTU + CommandAddress + 业务类）。
 
 协议细节以 **[`ultraArm P1协议文档.xlsx`](ultraArm%20P1协议文档.xlsx)** 与 **[`../docs/ultraArm_P1_zh.md`](../docs/ultraArm_P1_zh.md)** 为准。
 
 ---
 
-## 架构（v0.3，对齐 Pro450）
+## 架构（v1.0.0）
 
 ```
 UltraArmP1Modbus (ultra_api.py)   — docs 命名 + 物理量校验
@@ -22,7 +22,7 @@ CommandAddress (command_address.py) — 地址常量
 | 模块 | 职责 |
 |------|------|
 | **`modbus_rtu.py`** | 串口事务 + **PDU 组帧/解析**（``build_read_pdu``、``decode_*`` 等同模块） |
-| **`command_address.py`** | 全部 G/M 地址常量（风格同 Pro450 ``CommandAddress``） |
+| **`command_address.py`** | 全部 G/M 地址常量 |
 | **`commands.py`** | ``P1Client``：每条指令直接 ``read_p1(A.M405)`` / ``write_p1(...)`` |
 | **`ultra_api_limits.py`** | 用户侧物理量范围校验 |
 | **`models.py`** | 结构化 payload（``ConveyorControl`` 等） |
@@ -38,6 +38,59 @@ pip install -e ".[dev]"
 
 - **运行依赖**：`pyserial`
 - **开发依赖**（可选）：`pytest`
+
+## 打包与本地安装
+
+在项目根目录执行以下命令，生成可分发的 wheel 与源码包：
+
+```bash
+python -m pip install --upgrade build
+python -m build
+```
+
+构建产物位于 `dist/`：
+
+- `p1_modbus-1.0.0-py3-none-any.whl`：推荐的安装包。
+- `p1_modbus-1.0.0.tar.gz`：源码发布包。
+
+安装刚生成的 wheel：
+
+```bash
+python -m pip install --force-reinstall dist/p1_modbus-1.0.0-py3-none-any.whl
+```
+
+确认当前 Python 环境使用的是已安装版本：
+
+```bash
+python -c "import p1_modbus; print(p1_modbus.__file__)"
+python -m pip show p1-modbus
+```
+
+> 开发调试使用 `pip install -e ".[dev]"`；交付或验证安装包时，请使用上面的 wheel 安装命令。
+
+## Git 工作流
+
+每项改动使用独立功能分支，完成测试后再合并：
+
+```bash
+# 1. 从最新主分支创建功能分支
+git switch main
+git pull --ff-only
+git switch -c codex/<feature-name>
+
+# 2. 开发、检查并测试
+git status
+pytest -q
+
+# 3. 仅暂存本次改动并提交
+git add README.md p1_modbus/ tests/
+git commit -m "docs: update packaging and Git workflow"
+
+# 4. 推送分支并创建合并请求
+git push -u origin codex/<feature-name>
+```
+
+提交前先检查 `git diff` 与 `git status`，不要把 `dist/`、`build/`、虚拟环境或本地硬件配置提交到仓库。
 
 ---
 
