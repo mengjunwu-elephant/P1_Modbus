@@ -41,6 +41,10 @@ def test_unverified_addrs_documented() -> None:
     assert CommandAddress.M46 in UNVERIFIED_ADDRS
 
 
+def test_m84_is_not_marked_unverified() -> None:
+    assert CommandAddress.M84 not in UNVERIFIED_ADDRS
+
+
 
 
 

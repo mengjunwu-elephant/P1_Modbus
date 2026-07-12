@@ -77,6 +77,5 @@ UNVERIFIED_ADDRS: frozenset[int] = frozenset(
         CommandAddress.M39,
         CommandAddress.M46,
         CommandAddress.M47,
-        CommandAddress.M84,
     }
 )

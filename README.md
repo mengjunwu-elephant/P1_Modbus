@@ -64,7 +64,7 @@ finally:
 
 ### xlsx「modbus协议」页 — 已实现
 
-`CommandAddress` 收录 G6/G7/G0/G1 系列、M5–M40、M50–M63、M70、M80–M83、M119、M401/M402/M405/M406、G8、M200、G11、**M600** 等（见 `p1_modbus/command_address.py`）。底层通过 ``P1Client`` 的 ``g*`` / ``m*`` 或 ``read_p1`` / ``write_p1`` 调用。
+`CommandAddress` 收录 G6/G7/G0/G1 系列、M5–M40、M50–M63、M70、M80–M84、M119、M300 写（`0x0036`）、M52（`0x0038`）、M401/M402/M405/M406、G8、M200、G11、**M600** 等（见 `p1_modbus/command_address.py`）。底层通过 ``P1Client`` 的 ``g*`` / ``m*`` 或 ``read_p1`` / ``write_p1`` 调用。
 
 ### 文档有、xlsx 未收录 — 已实现（地址待实机确认）
 
@@ -73,7 +73,6 @@ finally:
 | `set_conveyor_stop` | M39 | `0x000E` | 0 字节写 |
 | `coord_inverse_solution` | M46 | `0x001E` | FC03 + 8B 坐标×100 |
 | `angle_correct_solution` | M47 | `0x0032` | FC03 + 8B 角度×100 |
-| `get_pwm_status` | M84 | `0x0033` | FC03 读 |
 
 请用 [`scripts/probe_missing_modbus.py`](scripts/probe_missing_modbus.py) 或抓包验证后更新 `command_address.py` 中未验证地址：
 
@@ -128,6 +127,7 @@ python scripts/probe_missing_modbus.py COM5
 | `get_error_information` | G8 | `list[int]` |
 | `get_run_status` | M200 | `int` |
 | `get_queue_size` | M600 | `int` |
+| `get_limit_switch_state` | M52 | `int` |
 | `get_motor_enable_status` | M22 | `list[int]` |
 | `get_zero_calibration_state` | M119 | `list[int]` |
 | `get_gripper_angle` | M50 | `int` 1–100 |
@@ -155,6 +155,7 @@ python scripts/probe_missing_modbus.py COM5
 | `set_color` | M23 | RGB 0–255 |
 | `set_conveyor_control` | M38 | state/direction/speed/distance |
 | `set_conveyor_stop` | M39 | 传送带停止 |
+| `set_i2c_data(session_id, packet_id, slave_address, register_address, data)` | M300 写（`0x0036`） | I2C 数据长度 1..249；外层帧长度为单字节 |
 | `set_preview_mode(coords)` | M51 | 可达性；返回 0/1 |
 | `set_base_io_output` / `set_digital_io_output` | M60/M62 | 结构化 IO |
 | `set_pump_state` | M70 | 0/1/2 |
@@ -167,7 +168,7 @@ python scripts/probe_missing_modbus.py COM5
 
 **返回值**：多数 `set_*` 成功返回 **`0`**；`set_preview_mode` 不可达返回 **`1`**。超时/协议错误继承 `P1Client.request()` 异常。
 
-**范围校验**：关节角、坐标、速度 1–100、RGB/PWM/IO/传送带等 — 见 `ultra_api_limits.py`；超限 **`ValueError`**，不发送 Modbus。
+**范围校验**：关节角、坐标、速度 1–100、RGB/PWM/IO/传送带等 — 见 `ultra_api_limits.py`；`set_i2c_data` 的 I2C 数据长度为 1..249（外层帧长度为单字节）；超限 **`ValueError`**，不发送 Modbus。
 
 ---
 
@@ -207,7 +208,7 @@ pytest -q
 
 ## 对接前检查
 
-- M39/M46/M47/M84 地址以 **实机探测** 为准。
+- M39/M46/M47 地址以 **实机探测** 为准。
 - 运动 payload 字段顺序以 xlsx 为准；本库在 ``P1Client`` 各方法内按长度原样组帧。
 - CRC：`append_crc` / `verify_crc` 自洽；与标准 Modbus 经典向量的 **整数表示** 可能相差字节序，以本库与 P1 实机一致为准。
 
